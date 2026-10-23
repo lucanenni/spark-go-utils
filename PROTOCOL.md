@@ -1,6 +1,6 @@
 # Positive Grid Spark GO — BLE Protocol Notes
 
-Reverse-engineered notes on the Bluetooth LE protocol used by the **Positive Grid Spark GO** amp, based on BLE sniffs of the official app plus cross-referencing community reverse-engineering of the related Spark 40. This document covers **patch/preset switching**, the **tuner** (on/off plus the real-time note+cents data frames), and **individual effect (stompbox) toggling** — including reading a saved preset's pedal chain back from the device, finding out which patch is actually active, and tracking live (not just saved) effect state via the device's own real-time confirmations. It also covers **Guitar Volume** control and **tap tempo**, both confirmed on real hardware despite starting as speculative ports from a Spark 40/LIVE community project (see their own section for why "Music Volume" isn't part of this protocol at all). A **multi-file client layout** and **live-state tracking during patch changes** are still being reintroduced on other feature branches; see the project's branch list rather than expecting those here yet.
+Reverse-engineered notes on the Bluetooth LE protocol used by the **Positive Grid Spark GO** amp, based on BLE sniffs of the official app plus cross-referencing community reverse-engineering of the related Spark 40. This document covers **patch/preset switching**, the **tuner** (on/off plus the real-time note+cents data frames), and **individual effect (stompbox) toggling** — including reading a saved preset's pedal chain back from the device, finding out which patch is actually active, and tracking live (not just saved) effect state via the device's own real-time confirmations. It also covers **changing a pedal's parameters** (knob values), with a warning about the write rate at which that can lock the amp up, and **Guitar Volume** control and **tap tempo**, both confirmed on real hardware despite starting as speculative ports from a Spark 40/LIVE community project (see their own section for why "Music Volume" isn't part of this protocol at all). A **multi-file client layout** and **live-state tracking during patch changes** are still being reintroduced on other feature branches; see the project's branch list rather than expecting those here yet.
 
 > Everything here comes from passive BLE captures and black-box testing against a real device. There is no official protocol documentation — treat all of this as best-effort reverse engineering, not a spec.
 
@@ -31,6 +31,8 @@ The header is followed by an inner payload that starts with `F0 01` and ends wit
 ```
 [16-byte header][F0 01 ... F7]
 ```
+
+**This header is outgoing-only.** Incoming notifications on `ffc2` carry **no** 16-byte block header: the bytes delivered are just the raw `F0 01 ... F7` chunk stream (split arbitrarily across notifications, see "Reading the current preset" for reassembly). Confirmed on a Spark GO from an iOS (CoreBluetooth) client (reported in #8, not reproduced by this repo's own clients): a full connect-and-preset-read of ~1.9 kB across ~107 notifications contained the `01 FE 00 00 53 FE` preamble nowhere. This differs from paulhamsh's Spark 40 material, which documents the `01 FE 00 00 <dir> FE <len>` block wrapper in *both* directions for its serial transport. Don't assume the symmetry: an assembler that waits for a block header on the incoming side will silently discard every reply and look exactly like an amp that has stopped answering.
 
 ## Preset / patch change
 
@@ -171,7 +173,7 @@ There is no way to infer which of the 4 saved patches is currently loaded just f
 `CMD 0x02, SUB_CMD 0x01` requests a specific saved patch by number (0-based, matching the patch-change command's `PID`). Payload: `00 00 [preset_num] [32×00 padding] 00 00` (the padding's exact purpose isn't confirmed, but it round-trips fine as all-zero).
 
 The device replies with a **multi-chunk** response, `CMD 0x03, SUB_CMD 0x01`, spread across many BLE notifications (confirmed: 15 chunks / ~566 raw bytes for one preset). To reassemble:
-1. Concatenate all raw notification bytes in arrival order (GATT notifications don't align to message boundaries — a single `F0 01 ... F7` chunk can and does span several separate notifications).
+1. Concatenate all raw notification bytes in arrival order (GATT notifications don't align to message boundaries — a single `F0 01 ... F7` chunk can and does span several separate notifications). There is no 16-byte block header to strip on this side — notifications are bare chunk bytes (see the envelope section above).
 2. Split the concatenated stream on `F7` bytes into individual chunks, each shaped like any other message: `F0 01 SEQ CHECKSUM CMD SUB_CMD [7bit-packed data] F7`.
 3. Unpack each chunk's data from 7-bit back to 8-bit (same algorithm as the toggle command, in reverse).
 4. Since `CMD 0x03 / SUB_CMD 0x01` is a multi-chunk message, each unpacked chunk's data starts with `[num_chunks] [this_chunk_index] [chunk_len]` (3 bytes) followed by that chunk's slice of the real payload. Concatenate the real payload slices (i.e. everything after those first 3 bytes) across all chunks in order. A request's own `SEQ` must be tracked and matched against each incoming chunk's `SEQ` — an in-flight reassembly should discard chunks belonging to a stale/superseded request instead of corrupting the current one.
@@ -197,10 +199,41 @@ This means a client can build a **correct, general-purpose toggle for whatever's
 
 **Important correction, found via real-hardware testing**: this read reflects the patch's **saved/flash-stored** configuration, not the device's **live** current state. Toggling an effect changes what's actually playing but does **not** rewrite the saved patch — re-reading the same preset number afterward returns the exact same (pre-toggle) bytes. Confirmed directly: toggled `ChorusAnalog` on (audible on the amp, and confirmed via the real-time confirmation above), then re-read that same preset — it still reported Off, byte-for-byte identical to the pre-toggle read. **Never re-read the preset to "confirm" a toggle** — that would silently overwrite a correct live update with the stale saved value moments later. Loading a patch (`CMD 0x01/SUB_CMD 0x38`) *does* reset live state to match the saved data (that's what "loading" a patch means), so reading right after a patch change is accurate — it's specifically post-toggle reads of the same patch that are misleading. Use "Real-time effect-state confirmation" above to track live changes instead.
 
+**Parameter counts: read `N` from the message, never hard-code it.** On a Spark GO (reported in #8), `bias.reverb` came back from a preset read with **8** parameters, e.g. `bias.reverb ON [0.425, 0.120, 0.075, 0.694, 0.488, 0.466, 0.300, 1.000]`, where the Spark 40 effect catalogues document 7 (Level, Damping, Low Cut, High Cut, Dwell, Time, plus the reverb-type selector at index 6). What index 7 is hasn't been identified. The parser above is already driven by the `0x90 + N` count so nothing here breaks, but anything downstream that assumes a per-pedal count from a Spark 40 catalogue will be off by one for this pedal.
+
+### Changing an effect parameter (knob value)
+
+`CMD 0x01, SUB_CMD 0x04` (`change_effect_parameter` in `SparkClass.py`). **Confirmed working on a Spark GO** (reported in #8 from an iOS/CoreBluetooth client, write-without-response, not reproduced by this repo's own clients; same envelope / 8-bit→7-bit packing / XOR checksum as everything else), with exactly the encoding `SparkClass.py` uses for the Spark 40. Raw payload before packing:
+
+```
+[len(name)] [len(name)+0xA0] [name bytes, ASCII] [param index, one byte] [0xCA] [4-byte big-endian IEEE 754 float]
+```
+
+- `name` is the pedal's **internal codename**, same as for the toggle command — get it from a preset read rather than guessing it.
+- `param index` — one byte, the parameter's 0-based position in the pedal's parameter list (matches the `[param id]` byte in the preset read in every case seen so far).
+- The float is `0.0`–`1.0`, like every other parameter value in this protocol.
+- There is **no trailing `0x00`** here, unlike the toggle payload.
+
+Confirmed audibly and by trace on `DelayRe201`, `bias.reverb`, `LA2AComp` and `bias.noisegate`, driving a parameter continuously and hearing the amp follow. The amp sent **no acknowledgement of any kind** for this command — not the rich `CMD 0x03` echo that toggles get, not even the generic `CMD 0x04` ack — so there is nothing to wait on and no way to confirm from the wire that a write landed. Presumably it changes **live** state only, like the toggle command, but that hasn't been verified by re-reading the preset after a parameter write.
+
+`SUB_CMD 0x15` (toggle) and `SUB_CMD 0x04` compose as expected: reading the preset, switching on a bypassed pedal by its real internal name, and then driving its parameters all works in one sequence.
+
+#### Write rate: streaming parameter changes can lock the amp up
+
+An **observation from one amp (reported in #8), not a measured safe limit**. Nothing in the published Spark reverse engineering, this repo included, has been exercised at a sustained write rate, so there is no established safe rate, and this edge was found by accident:
+
+- Streaming roughly **60 parameter writes per second** (`0x01 0x04`, write-without-response, ~40-byte messages) **locked a Spark GO up twice**. Not a stuck sound: the amp became unresponsive, ignored its own front-panel controls, and needed a long power-press to shut down, with a pop on the way out.
+- The same amp was untroubled by **30 continuous seconds at 2 writes per second**, twice, on two different parameters.
+- Where between 2/s and 60/s it becomes unsafe has **not** been bisected. The client that hit this now sends at 15/s and has not reproduced the lockup, but that is a guess that happens to have held so far, not a tested ceiling.
+
+Both lockups happened with `0x01 0x04` traffic specifically, though there's no reason to assume the sub-command matters more than the rate. If you build anything that *automates* parameters rather than setting them once on a user action, rate-limit your writes before you find this edge by accident. (The client that hit this coalesces to the latest value per parameter rather than queueing intermediate values — whether that matters, beyond keeping the rate down, is untested.)
+
 ### Open questions
 
 - Confirm the `[32×00 padding]` in the preset-request payload is really inert filler and not encoding something (only tested with all-zero padding so far).
-- Work out `CMD 0x01 / SUB_CMD 0x06` (`change_effect`, i.e. swapping which pedal model occupies a slot) and `SUB_CMD 0x04` (`change_effect_parameter`, adjusting a knob) — same underlying encoding, per `SparkClass.py`, just not yet built or tested for the Spark GO.
+- Work out `CMD 0x01 / SUB_CMD 0x06` (`change_effect`, i.e. swapping which pedal model occupies a slot) — same underlying encoding, per `SparkClass.py`, just not yet built or tested for the Spark GO. (`SUB_CMD 0x04`, `change_effect_parameter`, has since been confirmed — see "Changing an effect parameter" above.)
+- Establish an actual safe write rate for streamed `0x01 0x04` parameter changes: lockups at ~60/s, fine at 2/s, 15/s unreproduced but untested at length (see the write-rate warning above). Nobody has bisected it, and it may differ per model/firmware.
+- Identify the 8th parameter (index 7) that `bias.reverb` reports on a Spark GO, where the Spark 40 catalogues list 7.
 - Confirm whether `CMD 0x02/SUB_CMD 0x10`'s companion `01 00`-marked preset request (per `SparkCommsClass.py` in `richtamblyn/PGSparkLite`) ever actually differs from an ordinary `SUB_CMD 0x01` request for the same number — on real hardware it returned the identical saved-slot data, so both reference clients skip sending it and just combine the `SUB_CMD 0x10` answer with an ordinary `SUB_CMD 0x01` request instead.
 - Identify what the second device seen in an early, unrelated capture (`E4:DE:10:0D:69:0C`, characteristics `FFC9`/`FFCA`) actually is (a Spark Control footswitch is the leading guess) — not the Spark GO, not blocking anything here.
 
